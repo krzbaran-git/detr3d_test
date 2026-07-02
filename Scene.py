@@ -2,8 +2,11 @@ import numpy as np
 import pandas as pd
 from pyquaternion import Quaternion
 from scipy.spatial.transform import Rotation
+from scipy.optimize import linear_sum_assignment
+from joblib import Parallel, delayed
 
 from tools.functions import load_json
+from tools.PascalMeasure import PascalMeasure3D
 from Sensors.Sensors import LidarSensor, CameraSensor, RadarSensor
 from DataParsers.SystemDataParser import SystemDataParser
 from DataParsers.LabelingDataParser import LabelingDataParser
@@ -24,13 +27,17 @@ class Scene:
         self.sample_data = None
         self.system_data = None
         self.labeling_data = None
+        self.paired_df = None
 
+
+    # Building data
     def build_scene(self):
         self._get_scene_parameters()
         self._get_sensors()
         self._get_ego_pose()
         self._parse_system_data()
         self._parse_labeling_data()
+        self._enrich_with_cameras()
         self.global_to_ego()
 
     def _parse_system_data(self):
@@ -51,11 +58,20 @@ class Scene:
                 }
 
         self.system_data['Timestamp'] = self.system_data['Sample token'].map(
-            lambda t: lookup.get(t, {}).get('Timestamp')
-        )
+            lambda t: lookup.get(t, {}).get('Timestamp'))
         self.system_data['Sensor ID'] = self.system_data['Sample token'].map(
-            lambda t: lookup.get(t, {}).get('Sensor ID')
-        )
+            lambda t: lookup.get(t, {}).get('Sensor ID'))
+
+    def _enrich_with_cameras(self):
+        cam_lookup = {}
+        for entry in self.sample_data:
+            token = entry['sample_token']
+            sensor = self.sensors.get(entry['calibrated_sensor_token'])
+            if isinstance(sensor, CameraSensor):
+                cam_lookup.setdefault(token, {})[sensor.channel] = entry['calibrated_sensor_token']
+
+        self.system_data['Cameras'] = self.system_data['Sample token'].map(cam_lookup)
+        self.labeling_data['Cameras'] = self.labeling_data['Sample token'].map(cam_lookup)
 
     def _parse_labeling_data(self):
         path = self.scene_path + f'/{self.scene_name}' + '/v1.0-trainval/sample_annotation.json'
@@ -91,7 +107,7 @@ class Scene:
             else:
                 new_sensor = None
 
-            self.sensors[sensor_token] = new_sensor
+            self.sensors[token] = new_sensor
 
     def _get_ego_pose(self):
         ego_pose_path = self.scene_path + f'/{self.scene_name}' + '/v1.0-trainval/ego_pose.json'
@@ -110,9 +126,6 @@ class Scene:
 
     def _find_by_token(self, data: list[dict], token_name: str, token_value: str) -> dict | None:
         return next((item for item in data if item[token_name] == token_value), None)
-
-    def filter_key_frames(self):
-        pass
 
     def global_to_ego(self):
         # lookup: sample_token → ego_pose_token
@@ -133,8 +146,118 @@ class Scene:
                 df[['PosX', 'PosY', 'PosZ']] = df.apply(transform, axis=1)
 
 
+    # Data evaluation
+    def build_pairs(self, max_match_dist: float = 3.0):
+        from scipy.optimize import linear_sum_assignment
+
+        records = []
+
+        for sample_token in self.system_data['Sample token'].unique():
+            sys_sample = self.system_data[self.system_data['Sample token'] == sample_token]
+            ref_sample = self.labeling_data[self.labeling_data['Sample token'] == sample_token]
+
+            sys_positions = sys_sample[['PosX', 'PosY', 'PosZ']].values
+            ref_positions = ref_sample[['PosX', 'PosY', 'PosZ']].values
+
+            diff = sys_positions[:, np.newaxis, :] - ref_positions[np.newaxis, :, :]
+            dist_matrix = np.linalg.norm(diff, axis=2)
+
+            row_ind, col_ind = linear_sum_assignment(dist_matrix)
+
+            matched_sys = set()
+            matched_ref = set()
+
+            for sys_idx, ref_idx in zip(row_ind, col_ind):
+                sys_row = sys_sample.iloc[sys_idx]
+                ref_row = ref_sample.iloc[ref_idx]
+                dist = dist_matrix[sys_idx, ref_idx]
+
+                if dist <= max_match_dist:
+                    matched_sys.add(sys_idx)
+                    matched_ref.add(ref_idx)
+                    records.append({
+                        'Sample token': sample_token,
+                        'Paired': True,
+                        'Distance': dist,
+                        'Sys_PosX': sys_row['PosX'], 'Sys_PosY': sys_row['PosY'], 'Sys_PosZ': sys_row['PosZ'],
+                        'Sys_Yaw': sys_row['Yaw'], 'Sys_Pitch': sys_row['Pitch'], 'Sys_Roll': sys_row['Roll'],
+                        'Sys_Width': sys_row['Width'], 'Sys_Length': sys_row['Length'], 'Sys_Height': sys_row['Height'],
+                        'Sys_Class': sys_row['Class'], 'Sys_Probability': sys_row['Probability'],
+                        'Ref_PosX': ref_row['PosX'], 'Ref_PosY': ref_row['PosY'], 'Ref_PosZ': ref_row['PosZ'],
+                        'Ref_Yaw': ref_row['Yaw'], 'Ref_Pitch': ref_row['Pitch'], 'Ref_Roll': ref_row['Roll'],
+                        'Ref_Width': ref_row['Width'], 'Ref_Length': ref_row['Length'], 'Ref_Height': ref_row['Height'],
+                        'Ref_Class': ref_row['Class'],
+                    })
+
+            # Sys not in ref
+            for sys_idx in range(len(sys_sample)):
+                if sys_idx not in matched_sys:
+                    sys_row = sys_sample.iloc[sys_idx]
+                    records.append({
+                        'Sample token': sample_token,
+                        'Paired': False,
+                        'Distance': None,
+                        'Sys_PosX': sys_row['PosX'], 'Sys_PosY': sys_row['PosY'], 'Sys_PosZ': sys_row['PosZ'],
+                        'Sys_Yaw': sys_row['Yaw'], 'Sys_Pitch': sys_row['Pitch'], 'Sys_Roll': sys_row['Roll'],
+                        'Sys_Width': sys_row['Width'], 'Sys_Length': sys_row['Length'], 'Sys_Height': sys_row['Height'],
+                        'Sys_Class': sys_row['Class'], 'Sys_Probability': sys_row['Probability'],
+                        'Ref_PosX': None, 'Ref_PosY': None, 'Ref_PosZ': None,
+                        'Ref_Yaw': None, 'Ref_Pitch': None, 'Ref_Roll': None,
+                        'Ref_Width': None, 'Ref_Length': None, 'Ref_Height': None,
+                        'Ref_Class': None,
+                    })
+
+            # Ref not in Sys
+            for ref_idx in range(len(ref_sample)):
+                if ref_idx not in matched_ref:
+                    ref_row = ref_sample.iloc[ref_idx]
+                    records.append({
+                        'Sample token': sample_token,
+                        'Paired': False,
+                        'Distance': None,
+                        'Sys_PosX': None, 'Sys_PosY': None, 'Sys_PosZ': None,
+                        'Sys_Yaw': None, 'Sys_Pitch': None, 'Sys_Roll': None,
+                        'Sys_Width': None, 'Sys_Length': None, 'Sys_Height': None,
+                        'Sys_Class': None, 'Sys_Probability': None,
+                        'Ref_PosX': ref_row['PosX'], 'Ref_PosY': ref_row['PosY'], 'Ref_PosZ': ref_row['PosZ'],
+                        'Ref_Yaw': ref_row['Yaw'], 'Ref_Pitch': ref_row['Pitch'], 'Ref_Roll': ref_row['Roll'],
+                        'Ref_Width': ref_row['Width'], 'Ref_Length': ref_row['Length'], 'Ref_Height': ref_row['Height'],
+                        'Ref_Class': ref_row['Class'],
+                    })
+
+        self.paired_df = pd.DataFrame(records)
+        self._calculate_pascal_measure()
+
+    def _calculate_pascal_measure(self, n_samples: int = 10000, n_jobs: int = -1):
+
+        def _compute_row_iou(row):
+            obj1 = {
+                'PosX': row['Sys_PosX'], 'PosY': row['Sys_PosY'], 'PosZ': row['Sys_PosZ'],
+                'Yaw': row['Sys_Yaw'], 'Pitch': row['Sys_Pitch'], 'Roll': row['Sys_Roll'],
+                'Width': row['Sys_Width'], 'Length': row['Sys_Length'], 'Height': row['Sys_Height'],
+            }
+            obj2 = {
+                'PosX': row['Ref_PosX'], 'PosY': row['Ref_PosY'], 'PosZ': row['Ref_PosZ'],
+                'Yaw': row['Ref_Yaw'], 'Pitch': row['Ref_Pitch'], 'Roll': row['Ref_Roll'],
+                'Width': row['Ref_Width'], 'Length': row['Ref_Length'], 'Height': row['Ref_Height'],
+            }
+            return PascalMeasure3D(obj1, obj2, n_samples).compute_iou()
+
+        paired = self.paired_df[self.paired_df['Paired'] == True].copy()
+        rows = [row for _, row in paired.iterrows()]
+
+        ious = Parallel(n_jobs=n_jobs)(delayed(_compute_row_iou)(row) for row in rows)
+        self.paired_df.loc[paired.index, 'PascalMeasure'] = ious
+
+
+    # Visualization
+    def visualize_scene(self):
+        pass
+
+
 if __name__ == '__main__':
     test_scene_path = r"D:/Programiki do nauki i inne/Szkolne/Studia/Projekt inzynierski/Logi NuScenes/scene-0103"
     test_scene = Scene(test_scene_path)
     test_scene.build_scene()
+    test_scene.build_pairs()
     db = 0
