@@ -1,16 +1,8 @@
-# This is a sample Python script.
+from Results.ResultBuilder import ResultBuilder
 
-# Press Shift+F10 to execute it or replace it with your code.
-# Press Double Shift to search everywhere for classes, files, tool windows, actions, and settings.
-
-
-def print_hi(name):
-    # Use a breakpoint in the code line below to debug your script.
-    print(f'Hi, {name}')  # Press Ctrl+F8 to toggle the breakpoint.
-
-
-# Press the green button in the gutter to run the script.
 if __name__ == '__main__':
-    print_hi('PyCharm')
+    path = r"D:\Programiki do nauki i inne\Szkolne\Studia\Projekt inzynierski\Logi NuScenes"
+    res = ResultBuilder(path)
+    res.build()
+    db = 0
 
-# See PyCharm help at https://www.jetbrains.com/help/pycharm/

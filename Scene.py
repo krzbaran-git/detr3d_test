@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+import os
 from pyquaternion import Quaternion
 from scipy.spatial.transform import Rotation
 from scipy.optimize import linear_sum_assignment
@@ -7,6 +8,7 @@ from joblib import Parallel, delayed
 
 from tools.functions import load_json
 from tools.PascalMeasure import PascalMeasure3D
+from tools.CameraVisualizer import CameraVisualizer
 from Sensors.Sensors import LidarSensor, CameraSensor, RadarSensor
 from DataParsers.SystemDataParser import SystemDataParser
 from DataParsers.LabelingDataParser import LabelingDataParser
@@ -115,7 +117,7 @@ class Scene:
         self.ego_pose = {entry['token']: entry for entry in ego_pose}
 
     def _get_scene_parameters(self):
-        self.scene_name = self.scene_path.split('/')[-1]
+        self.scene_name = os.path.basename(self.scene_path)
         params_path = self.scene_path + f'/{self.scene_name}' + '/v1.0-trainval/scene.json'
         params_dict = load_json(params_path)[0]
         self.scene_token = params_dict['token']
@@ -128,7 +130,6 @@ class Scene:
         return next((item for item in data if item[token_name] == token_value), None)
 
     def global_to_ego(self):
-        # lookup: sample_token → ego_pose_token
         ego_token_lookup = {
             entry['sample_token']: entry['ego_pose_token']
             for entry in self.sample_data
@@ -138,12 +139,21 @@ class Scene:
             ego_pose_token = ego_token_lookup[row['Sample token']]
             ego = self.ego_pose[ego_pose_token]
             r = Rotation.from_quat([*ego['rotation'][1:], ego['rotation'][0]])
+
+            # pozycja
             point = np.array([row['PosX'], row['PosY'], row['PosZ']]) - np.array(ego['translation'])
-            return pd.Series(r.inv().apply(point), index=['PosX', 'PosY', 'PosZ'])
+            pos_ego = r.inv().apply(point)
+
+            # orientacja
+            r_obj = Rotation.from_euler('ZYX', [row['Yaw'], row['Pitch'], row['Roll']])
+            r_obj_ego = r.inv() * r_obj
+            yaw, pitch, roll = r_obj_ego.as_euler('ZYX')
+
+            return pd.Series([*pos_ego, yaw, pitch, roll], index=['PosX', 'PosY', 'PosZ', 'Yaw', 'Pitch', 'Roll'])
 
         for df in [self.system_data, self.labeling_data]:
             if df is not None:
-                df[['PosX', 'PosY', 'PosZ']] = df.apply(transform, axis=1)
+                df[['PosX', 'PosY', 'PosZ', 'Yaw', 'Pitch', 'Roll']] = df.apply(transform, axis=1)
 
 
     # Data evaluation
@@ -187,6 +197,7 @@ class Scene:
                         'Ref_Yaw': ref_row['Yaw'], 'Ref_Pitch': ref_row['Pitch'], 'Ref_Roll': ref_row['Roll'],
                         'Ref_Width': ref_row['Width'], 'Ref_Length': ref_row['Length'], 'Ref_Height': ref_row['Height'],
                         'Ref_Class': ref_row['Class'],
+                        'Cameras': sys_row['Cameras'],
                     })
 
             # Sys not in ref
@@ -205,6 +216,7 @@ class Scene:
                         'Ref_Yaw': None, 'Ref_Pitch': None, 'Ref_Roll': None,
                         'Ref_Width': None, 'Ref_Length': None, 'Ref_Height': None,
                         'Ref_Class': None,
+                        'Cameras': sys_row['Cameras'],
                     })
 
             # Ref not in Sys
@@ -223,12 +235,13 @@ class Scene:
                         'Ref_Yaw': ref_row['Yaw'], 'Ref_Pitch': ref_row['Pitch'], 'Ref_Roll': ref_row['Roll'],
                         'Ref_Width': ref_row['Width'], 'Ref_Length': ref_row['Length'], 'Ref_Height': ref_row['Height'],
                         'Ref_Class': ref_row['Class'],
+                        'Cameras': ref_row['Cameras'],
                     })
 
         self.paired_df = pd.DataFrame(records)
         self._calculate_pascal_measure()
 
-    def _calculate_pascal_measure(self, n_samples: int = 10000, n_jobs: int = -1):
+    def _calculate_pascal_measure(self, n_samples: int = 10_000, n_jobs: int = -1):
 
         def _compute_row_iou(row):
             obj1 = {
@@ -246,13 +259,35 @@ class Scene:
         paired = self.paired_df[self.paired_df['Paired'] == True].copy()
         rows = [row for _, row in paired.iterrows()]
 
-        ious = Parallel(n_jobs=n_jobs)(delayed(_compute_row_iou)(row) for row in rows)
+        ious = Parallel(n_jobs=n_jobs, backend='threading')(delayed(_compute_row_iou)(row) for row in rows)
         self.paired_df.loc[paired.index, 'PascalMeasure'] = ious
 
 
     # Visualization
-    def visualize_scene(self):
-        pass
+    def visualize_scene(self, output_path: str):
+        for sample_token in self.paired_df['Sample token'].unique():
+            sample_entries = {
+                entry['channel']: entry
+                for entry in self.sample_data
+                if entry['sample_token'] == sample_token
+                   and isinstance(self.sensors.get(entry['calibrated_sensor_token']), CameraSensor)
+            }
+
+            paired = self.paired_df[
+                (self.paired_df['Sample token'] == sample_token) & (self.paired_df['Paired'] == True)]
+            unpaired_sys = self.paired_df[
+                (self.paired_df['Sample token'] == sample_token) & (self.paired_df['Paired'] == False) & (
+                    self.paired_df['Sys_PosX'].notna())]
+            unpaired_ref = self.paired_df[
+                (self.paired_df['Sample token'] == sample_token) & (self.paired_df['Paired'] == False) & (
+                    self.paired_df['Ref_PosX'].notna())]
+
+            for channel, entry in sample_entries.items():
+                camera = self.sensors[entry['calibrated_sensor_token']]
+                image_path = os.path.join(self.scene_path, self.scene_name, entry['filename'])
+                vis = CameraVisualizer(camera, image_path)
+                vis.render(paired, unpaired_sys, unpaired_ref)
+                vis.save(os.path.join(output_path, channel, os.path.basename(entry['filename'])))
 
 
 if __name__ == '__main__':
@@ -260,4 +295,5 @@ if __name__ == '__main__':
     test_scene = Scene(test_scene_path)
     test_scene.build_scene()
     test_scene.build_pairs()
+    test_scene.visualize_scene(r'D:\Programiki do nauki i inne\Szkolne\Studia\Projekt inzynierski\Logi NuScenes\scene-0103\scene-0103\output')
     db = 0
