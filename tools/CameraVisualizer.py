@@ -11,19 +11,19 @@ class CameraVisualizer:
         self.camera = camera
         self.img    = cv2.imread(image_path)
 
-    def render(self, paired: pd.DataFrame, unpaired_sys: pd.DataFrame, unpaired_ref: pd.DataFrame):
+    def render(self, paired: pd.DataFrame, unpaired_sys: pd.DataFrame, unpaired_ref: pd.DataFrame, ego: dict):
         for _, row in paired.iterrows():
-            sys_pixels = self.project_object(self.row_to_obj(row, 'Sys'))
-            ref_pixels = self.project_object(self.row_to_obj(row, 'Ref'))
+            sys_pixels = self.project_object(self.row_to_obj(row, 'Sys'), ego)
+            ref_pixels = self.project_object(self.row_to_obj(row, 'Ref'), ego)
             self.draw_box(sys_pixels, color=(0, 0, 255))
             self.draw_box(ref_pixels, color=(0, 255, 0))
             self.draw_match(sys_pixels, ref_pixels, iou=row.get('PascalMeasure'))
 
         for _, row in unpaired_sys.iterrows():
-            self.draw_box(self.project_object(self.row_to_obj(row, 'Sys')), color=(255, 0, 0))
+            self.draw_box(self.project_object(self.row_to_obj(row, 'Sys'), ego), color=(255, 0, 0))
 
         for _, row in unpaired_ref.iterrows():
-            self.draw_box(self.project_object(self.row_to_obj(row, 'Ref')), color=(0, 255, 255))
+            self.draw_box(self.project_object(self.row_to_obj(row, 'Ref'), ego), color=(0, 255, 255))
 
     def save(self, output_path: str):
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
@@ -52,15 +52,21 @@ class CameraVisualizer:
             cv2.putText(self.img, f'{iou:.2f}', mid,
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
-    def project_object(self, obj: dict) -> np.ndarray | None:
-        corners_ego = self._get_box_corners(obj)
+    def project_object(self, obj: dict, ego: dict) -> np.ndarray | None:
+        corners_global = self._get_box_corners(obj)
+
+        R_ego = Rotation.from_quat([*ego['rotation'][1:], ego['rotation'][0]])
+        corners_ego = R_ego.inv().apply(corners_global - np.array(ego['translation']))
+
         R_cam = Rotation.from_quat([*self.camera.rotation[1:], self.camera.rotation[0]])
         corners_cam = R_cam.inv().apply(corners_ego - np.array(self.camera.translation))
+
         if np.any(corners_cam[:, 2] <= 0):
             return None
-        K         = np.array(self.camera.camera_intrinsic)
+
+        K = np.array(self.camera.camera_intrinsic)
         projected = (K @ corners_cam.T).T
-        pixels    = projected[:, :2] / projected[:, 2:3]
+        pixels = projected[:, :2] / projected[:, 2:3]
         return pixels.astype(int)
 
     def _get_box_corners(self, obj: dict) -> np.ndarray:

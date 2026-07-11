@@ -15,7 +15,8 @@ class ResultBuilder:
 
     def build(self):
         scene_dirs = [d for d in os.listdir(self.path)
-                      if os.path.isdir(os.path.join(self.path, d))]
+                      if os.path.isdir(os.path.join(self.path, d))
+                      and d.startswith('scene-')]
 
         for scene_dir in tqdm(scene_dirs, desc='Building scenes'):
             scene_path = os.path.join(self.path, scene_dir)

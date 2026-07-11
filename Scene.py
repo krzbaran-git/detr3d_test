@@ -40,7 +40,7 @@ class Scene:
         self._parse_system_data()
         self._parse_labeling_data()
         self._enrich_with_cameras()
-        self.global_to_ego()
+        # self.global_to_ego()
 
     def _parse_system_data(self):
         path = self.scene_path + '/results_nusc_detr3d.json'
@@ -50,30 +50,33 @@ class Scene:
         self._enrich_with_sample_data()
 
     def _enrich_with_sample_data(self):
-        lookup = {}
+        timestamp_lookup = {}
+        sensor_lookup = {}
+
         for entry in self.sample_data:
             token = entry['sample_token']
-            if token not in lookup:
-                lookup[token] = {
-                    'Timestamp': entry['timestamp'],
-                    'Sensor ID': entry['calibrated_sensor_token'],
-                }
+            if token not in timestamp_lookup:
+                timestamp_lookup[token] = entry['timestamp']
+                sensor_lookup[token] = entry['calibrated_sensor_token']
 
-        self.system_data['Timestamp'] = self.system_data['Sample token'].map(
-            lambda t: lookup.get(t, {}).get('Timestamp'))
-        self.system_data['Sensor ID'] = self.system_data['Sample token'].map(
-            lambda t: lookup.get(t, {}).get('Sensor ID'))
+        self.system_data['Timestamp'] = self.system_data['Sample token'].map(timestamp_lookup)
+        self.system_data['Sensor ID'] = self.system_data['Sample token'].map(sensor_lookup)
 
     def _enrich_with_cameras(self):
         cam_lookup = {}
+        ego_lookup = {}
+
         for entry in self.sample_data:
             token = entry['sample_token']
             sensor = self.sensors.get(entry['calibrated_sensor_token'])
             if isinstance(sensor, CameraSensor):
                 cam_lookup.setdefault(token, {})[sensor.channel] = entry['calibrated_sensor_token']
+            ego_lookup.setdefault(token, {})[entry['calibrated_sensor_token']] = entry['ego_pose_token']
 
         self.system_data['Cameras'] = self.system_data['Sample token'].map(cam_lookup)
+        self.system_data['Ego poses'] = self.system_data['Sample token'].map(ego_lookup)
         self.labeling_data['Cameras'] = self.labeling_data['Sample token'].map(cam_lookup)
+        self.labeling_data['Ego poses'] = self.labeling_data['Sample token'].map(ego_lookup)
 
     def _parse_labeling_data(self):
         path = self.scene_path + f'/{self.scene_name}' + '/v1.0-trainval/sample_annotation.json'
@@ -270,6 +273,7 @@ class Scene:
                 entry['channel']: entry
                 for entry in self.sample_data
                 if entry['sample_token'] == sample_token
+                   and entry['is_key_frame'] == True
                    and isinstance(self.sensors.get(entry['calibrated_sensor_token']), CameraSensor)
             }
 
@@ -284,9 +288,11 @@ class Scene:
 
             for channel, entry in sample_entries.items():
                 camera = self.sensors[entry['calibrated_sensor_token']]
+                ego = self.ego_pose[entry['ego_pose_token']]
                 image_path = os.path.join(self.scene_path, self.scene_name, entry['filename'])
+
                 vis = CameraVisualizer(camera, image_path)
-                vis.render(paired, unpaired_sys, unpaired_ref)
+                vis.render(paired, unpaired_sys, unpaired_ref, ego)
                 vis.save(os.path.join(output_path, channel, os.path.basename(entry['filename'])))
 
 
