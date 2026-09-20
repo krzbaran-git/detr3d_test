@@ -9,6 +9,8 @@ from joblib import Parallel, delayed
 from tools.functions import load_json
 from tools.PascalMeasure import PascalMeasure3D
 from tools.CameraVisualizer import CameraVisualizer
+from tools.MapBEVVisualizer import MapBEVVisualizer
+from tools.ObjectsMatcher import ObjectsMatcher
 from Sensors.Sensors import LidarSensor, CameraSensor, RadarSensor
 from DataParsers.SystemDataParser import SystemDataParser
 from DataParsers.LabelingDataParser import LabelingDataParser
@@ -81,7 +83,15 @@ class Scene:
     def _parse_labeling_data(self):
         path = self.scene_path + f'/{self.scene_name}' + '/v1.0-trainval/sample_annotation.json'
         parser = LabelingDataParser(path)
-        parser.parse()
+
+        valid_tokens = set()
+        timestamp_lookup = {}
+        for entry in self.sample_data:
+            if entry['is_key_frame']:
+                valid_tokens.add(entry['sample_token'])
+                timestamp_lookup.setdefault(entry['sample_token'], entry['timestamp'])
+
+        parser.parse(valid_tokens=valid_tokens, timestamp_lookup=timestamp_lookup)
         self.labeling_data = parser.df
 
     def _get_sensors(self):
@@ -118,6 +128,11 @@ class Scene:
         ego_pose_path = self.scene_path + f'/{self.scene_name}' + '/v1.0-trainval/ego_pose.json'
         ego_pose = load_json(ego_pose_path)
         self.ego_pose = {entry['token']: entry for entry in ego_pose}
+
+    def _get_map_path(self):
+        map_json = load_json(self.scene_path + f'/{self.scene_name}' + '/v1.0-trainval/map.json')
+        entry = next(m for m in map_json if self.log_token in m['log_tokens'])
+        return os.path.join(self.scene_path, self.scene_name, entry['filename'])
 
     def _get_scene_parameters(self):
         self.scene_name = os.path.basename(self.scene_path)
@@ -160,89 +175,83 @@ class Scene:
 
 
     # Data evaluation
-    def build_pairs(self, max_match_dist: float = 3.0):
-        from scipy.optimize import linear_sum_assignment
-
+    def build_pairs(self):
+        matcher = ObjectsMatcher()
         records = []
 
         for sample_token in self.system_data['Sample token'].unique():
-            sys_sample = self.system_data[self.system_data['Sample token'] == sample_token]
-            ref_sample = self.labeling_data[self.labeling_data['Sample token'] == sample_token]
+            sys_sample = self.system_data[self.system_data['Sample token'] == sample_token].reset_index(drop=True)
+            ref_sample = self.labeling_data[self.labeling_data['Sample token'] == sample_token].reset_index(drop=True)
 
-            sys_positions = sys_sample[['PosX', 'PosY', 'PosZ']].values
-            ref_positions = ref_sample[['PosX', 'PosY', 'PosZ']].values
+            pairs, unmatched_sys, unmatched_ref = matcher.match(sys_sample, ref_sample)
 
-            diff = sys_positions[:, np.newaxis, :] - ref_positions[np.newaxis, :, :]
-            dist_matrix = np.linalg.norm(diff, axis=2)
+            # pary
+            for s, r, iou in pairs:
+                sys_row = sys_sample.iloc[s]
+                ref_row = ref_sample.iloc[r]
+                dist = np.sqrt(
+                    (sys_row['PosX'] - ref_row['PosX']) ** 2 +
+                    (sys_row['PosY'] - ref_row['PosY']) ** 2 +
+                    (sys_row['PosZ'] - ref_row['PosZ']) ** 2
+                )
+                records.append({
+                    'Sample token': sample_token,
+                    'Paired': True,
+                    'Distance': dist,
+                    'PascalMeasure': iou,
+                    'Sys_PosX': sys_row['PosX'], 'Sys_PosY': sys_row['PosY'], 'Sys_PosZ': sys_row['PosZ'],
+                    'Sys_Yaw': sys_row['Yaw'], 'Sys_Pitch': sys_row['Pitch'], 'Sys_Roll': sys_row['Roll'],
+                    'Sys_Width': sys_row['Width'], 'Sys_Length': sys_row['Length'], 'Sys_Height': sys_row['Height'],
+                    'Sys_VelX': sys_row['VelX'], 'Sys_VelY': sys_row['VelY'],
+                    'Sys_Class': sys_row['Class'], 'Sys_Probability': sys_row['Probability'],
+                    'Ref_PosX': ref_row['PosX'], 'Ref_PosY': ref_row['PosY'], 'Ref_PosZ': ref_row['PosZ'],
+                    'Ref_Yaw': ref_row['Yaw'], 'Ref_Pitch': ref_row['Pitch'], 'Ref_Roll': ref_row['Roll'],
+                    'Ref_Width': ref_row['Width'], 'Ref_Length': ref_row['Length'], 'Ref_Height': ref_row['Height'],
+                    'Ref_VelX': ref_row['VelX'], 'Ref_VelY': ref_row['VelY'],
+                    'Ref_Class': ref_row['Class'],
+                })
 
-            row_ind, col_ind = linear_sum_assignment(dist_matrix)
+            # Sys bez pary
+            for s in unmatched_sys:
+                sys_row = sys_sample.iloc[s]
+                records.append({
+                    'Sample token': sample_token,
+                    'Paired': False,
+                    'Distance': None,
+                    'PascalMeasure': None,
+                    'Sys_PosX': sys_row['PosX'], 'Sys_PosY': sys_row['PosY'], 'Sys_PosZ': sys_row['PosZ'],
+                    'Sys_Yaw': sys_row['Yaw'], 'Sys_Pitch': sys_row['Pitch'], 'Sys_Roll': sys_row['Roll'],
+                    'Sys_Width': sys_row['Width'], 'Sys_Length': sys_row['Length'], 'Sys_Height': sys_row['Height'],
+                    'Sys_VelX': sys_row['VelX'], 'Sys_VelY': sys_row['VelY'],
+                    'Sys_Class': sys_row['Class'], 'Sys_Probability': sys_row['Probability'],
+                    'Ref_PosX': None, 'Ref_PosY': None, 'Ref_PosZ': None,
+                    'Ref_Yaw': None, 'Ref_Pitch': None, 'Ref_Roll': None,
+                    'Ref_Width': None, 'Ref_Length': None, 'Ref_Height': None,
+                    'Ref_VelX': None, 'Ref_VelY': None,
+                    'Ref_Class': None,
+                })
 
-            matched_sys = set()
-            matched_ref = set()
-
-            for sys_idx, ref_idx in zip(row_ind, col_ind):
-                sys_row = sys_sample.iloc[sys_idx]
-                ref_row = ref_sample.iloc[ref_idx]
-                dist = dist_matrix[sys_idx, ref_idx]
-
-                if dist <= max_match_dist:
-                    matched_sys.add(sys_idx)
-                    matched_ref.add(ref_idx)
-                    records.append({
-                        'Sample token': sample_token,
-                        'Paired': True,
-                        'Distance': dist,
-                        'Sys_PosX': sys_row['PosX'], 'Sys_PosY': sys_row['PosY'], 'Sys_PosZ': sys_row['PosZ'],
-                        'Sys_Yaw': sys_row['Yaw'], 'Sys_Pitch': sys_row['Pitch'], 'Sys_Roll': sys_row['Roll'],
-                        'Sys_Width': sys_row['Width'], 'Sys_Length': sys_row['Length'], 'Sys_Height': sys_row['Height'],
-                        'Sys_Class': sys_row['Class'], 'Sys_Probability': sys_row['Probability'],
-                        'Ref_PosX': ref_row['PosX'], 'Ref_PosY': ref_row['PosY'], 'Ref_PosZ': ref_row['PosZ'],
-                        'Ref_Yaw': ref_row['Yaw'], 'Ref_Pitch': ref_row['Pitch'], 'Ref_Roll': ref_row['Roll'],
-                        'Ref_Width': ref_row['Width'], 'Ref_Length': ref_row['Length'], 'Ref_Height': ref_row['Height'],
-                        'Ref_Class': ref_row['Class'],
-                        'Cameras': sys_row['Cameras'],
-                    })
-
-            # Sys not in ref
-            for sys_idx in range(len(sys_sample)):
-                if sys_idx not in matched_sys:
-                    sys_row = sys_sample.iloc[sys_idx]
-                    records.append({
-                        'Sample token': sample_token,
-                        'Paired': False,
-                        'Distance': None,
-                        'Sys_PosX': sys_row['PosX'], 'Sys_PosY': sys_row['PosY'], 'Sys_PosZ': sys_row['PosZ'],
-                        'Sys_Yaw': sys_row['Yaw'], 'Sys_Pitch': sys_row['Pitch'], 'Sys_Roll': sys_row['Roll'],
-                        'Sys_Width': sys_row['Width'], 'Sys_Length': sys_row['Length'], 'Sys_Height': sys_row['Height'],
-                        'Sys_Class': sys_row['Class'], 'Sys_Probability': sys_row['Probability'],
-                        'Ref_PosX': None, 'Ref_PosY': None, 'Ref_PosZ': None,
-                        'Ref_Yaw': None, 'Ref_Pitch': None, 'Ref_Roll': None,
-                        'Ref_Width': None, 'Ref_Length': None, 'Ref_Height': None,
-                        'Ref_Class': None,
-                        'Cameras': sys_row['Cameras'],
-                    })
-
-            # Ref not in Sys
-            for ref_idx in range(len(ref_sample)):
-                if ref_idx not in matched_ref:
-                    ref_row = ref_sample.iloc[ref_idx]
-                    records.append({
-                        'Sample token': sample_token,
-                        'Paired': False,
-                        'Distance': None,
-                        'Sys_PosX': None, 'Sys_PosY': None, 'Sys_PosZ': None,
-                        'Sys_Yaw': None, 'Sys_Pitch': None, 'Sys_Roll': None,
-                        'Sys_Width': None, 'Sys_Length': None, 'Sys_Height': None,
-                        'Sys_Class': None, 'Sys_Probability': None,
-                        'Ref_PosX': ref_row['PosX'], 'Ref_PosY': ref_row['PosY'], 'Ref_PosZ': ref_row['PosZ'],
-                        'Ref_Yaw': ref_row['Yaw'], 'Ref_Pitch': ref_row['Pitch'], 'Ref_Roll': ref_row['Roll'],
-                        'Ref_Width': ref_row['Width'], 'Ref_Length': ref_row['Length'], 'Ref_Height': ref_row['Height'],
-                        'Ref_Class': ref_row['Class'],
-                        'Cameras': ref_row['Cameras'],
-                    })
+            # Ref bez pary
+            for r in unmatched_ref:
+                ref_row = ref_sample.iloc[r]
+                records.append({
+                    'Sample token': sample_token,
+                    'Paired': False,
+                    'Distance': None,
+                    'PascalMeasure': None,
+                    'Sys_PosX': None, 'Sys_PosY': None, 'Sys_PosZ': None,
+                    'Sys_Yaw': None, 'Sys_Pitch': None, 'Sys_Roll': None,
+                    'Sys_Width': None, 'Sys_Length': None, 'Sys_Height': None,
+                    'Sys_VelX': None, 'Sys_VelY': None,
+                    'Sys_Class': None, 'Sys_Probability': None,
+                    'Ref_PosX': ref_row['PosX'], 'Ref_PosY': ref_row['PosY'], 'Ref_PosZ': ref_row['PosZ'],
+                    'Ref_Yaw': ref_row['Yaw'], 'Ref_Pitch': ref_row['Pitch'], 'Ref_Roll': ref_row['Roll'],
+                    'Ref_Width': ref_row['Width'], 'Ref_Length': ref_row['Length'], 'Ref_Height': ref_row['Height'],
+                    'Ref_VelX': ref_row['VelX'], 'Ref_VelY': ref_row['VelY'],
+                    'Ref_Class': ref_row['Class'],
+                })
 
         self.paired_df = pd.DataFrame(records)
-        self._calculate_pascal_measure()
 
     def _calculate_pascal_measure(self, n_samples: int = 10_000, n_jobs: int = -1):
 
@@ -268,7 +277,12 @@ class Scene:
 
     # Visualization
     def visualize_scene(self, output_path: str):
+        # kolejność klatek po timestampie
+        frame_lookup = self._build_frame_lookup()
+
         for sample_token in self.paired_df['Sample token'].unique():
+            frame_name = frame_lookup[sample_token]
+
             sample_entries = {
                 entry['channel']: entry
                 for entry in self.sample_data
@@ -293,7 +307,23 @@ class Scene:
 
                 vis = CameraVisualizer(camera, image_path)
                 vis.render(paired, unpaired_sys, unpaired_ref, ego)
-                vis.save(os.path.join(output_path, channel, os.path.basename(entry['filename'])))
+                vis.save(os.path.join(output_path, channel, f'{frame_name}.jpg'))
+
+        self._visualize_map_bev(output_path, frame_lookup)
+
+    def _build_frame_lookup(self):
+        # sample_token → timestamp (z key frames), potem numeracja po czasie
+        ts = {}
+        for entry in self.sample_data:
+            if entry['is_key_frame'] and entry['sample_token'] not in ts:
+                ts[entry['sample_token']] = entry['timestamp']
+        ordered = sorted(ts, key=lambda t: ts[t])
+        return {token: f'Frame_{i + 1}' for i, token in enumerate(ordered)}
+
+    def _visualize_map_bev(self, output_path: str, frame_lookup: dict):
+        map_path = self._get_map_path()
+        bev = MapBEVVisualizer(self.paired_df, map_path, self.ego_pose, self.sample_data)
+        bev.save_all(os.path.join(output_path, 'MAP_BEV'), frame_lookup)
 
 
 if __name__ == '__main__':
