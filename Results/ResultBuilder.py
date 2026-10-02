@@ -4,6 +4,9 @@ import pandas as pd
 from tqdm import tqdm
 
 from Scene import Scene
+from tools.NuScenesVisualizer import NuscCameraVisualizer
+from tools.CameraVisualizer import CameraVisualizer
+
 
 class ResultBuilder:
 
@@ -24,36 +27,53 @@ class ResultBuilder:
         'movable_object.barrier':               'barrier',
     }
 
-    def __init__(self, path, vis=False):
-        self.path      = path
-        self.dataset   = []
-        self.df        = None
-        self.visualize = vis
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.path = cfg.path
+        self.dataset = []
+        self.df = None
+        self.adatrack_df = None
 
     def build(self):
         scene_dirs = [d for d in os.listdir(self.path)
                       if os.path.isdir(os.path.join(self.path, d))
                       and d.startswith('scene-')]
 
+        output_root = self.cfg.output_dir
+
         for scene_dir in tqdm(scene_dirs, desc='Building scenes'):
             scene_path = os.path.join(self.path, scene_dir)
 
-            scene = Scene(scene_path)
+            scene = Scene(scene_path, self.cfg)
             scene.build_scene()
-            scene.build_pairs()
+
+            scene.paired_df = scene.build_pairs(scene.detr_data)
+            scene.adatrack_paired_df = scene.build_pairs(scene.adatrack_data)
 
             scene.paired_df['Scene'] = scene_dir
+            scene.adatrack_paired_df['Scene'] = scene_dir
 
-            if self.visualize:
-                output_path = os.path.join(self.path, 'output', scene_dir)
-                scene.visualize_scene(output_path)
+            scene_out = os.path.join(output_root, scene_dir)
+            detr_out = os.path.join(scene_out, 'DETR')
+            ada_out = os.path.join(scene_out, 'ADATRACK')
+
+            self.calculate_metrics(scene.paired_df, detr_out)
+            self.calculate_metrics(scene.adatrack_paired_df, ada_out)
+
+            if self.cfg.visualize:
+                scene.visualize_scene(detr_out, scene.paired_df, visualizer_type=self.cfg.visualizer_type)
+                scene.visualize_scene(ada_out, scene.adatrack_paired_df, visualizer_type=self.cfg.visualizer_type)
 
             self.dataset.append(scene)
 
-        self.df = pd.concat([scene.paired_df for scene in self.dataset], ignore_index=True)
+        self.df = pd.concat([s.paired_df for s in self.dataset], ignore_index=True)
+        self.adatrack_df = pd.concat([s.adatrack_paired_df for s in self.dataset], ignore_index=True)
 
-    def calculate_metrics(self, output_dir='.', iou_threshold=0.5):
-        df = self.df.copy()
+        self.calculate_metrics(self.df, os.path.join(output_root, 'DETR'))
+        self.calculate_metrics(self.adatrack_df, os.path.join(output_root, 'ADATRACK'))
+
+    def calculate_metrics(self, df: pd.DataFrame, output_dir: str, iou_threshold=0.5):
+        df = df.copy()
         df['Ref_Class_Mapped'] = df['Ref_Class'].map(self.CLASS_MAP)
 
         classes = sorted(set(df['Sys_Class'].dropna()) | set(df['Ref_Class_Mapped'].dropna()))
@@ -67,7 +87,7 @@ class ResultBuilder:
                 sys_c = row['Sys_Class']
                 if pd.isna(ref_c):
                     continue
-                if row['PascalMeasure'] >= iou_threshold:
+                if row['IoU'] >= iou_threshold:
                     cm.loc[ref_c, sys_c] += 1
                 else:
                     cm.loc[ref_c, 'None'] += 1
@@ -79,7 +99,7 @@ class ResultBuilder:
                     cm.loc[row['Ref_Class_Mapped'], 'None'] += 1
 
         tp_mask = (df['Paired'] &
-                   (df['PascalMeasure'] >= iou_threshold) &
+                   (df['IoU'] >= iou_threshold) &
                    (df['Sys_Class'] == df['Ref_Class_Mapped']))
         df_tp = df[tp_mask].copy()
         df_tp['AVE'] = np.sqrt(
@@ -87,35 +107,44 @@ class ResultBuilder:
             (df_tp['Sys_VelY'] - df_tp['Ref_VelY']) ** 2
         )
         ave_by_class = df_tp.groupby('Sys_Class')['AVE'].mean()
+        matched = df[df['Paired'] & df['Ref_Class_Mapped'].notna()]
+        iou_stats = matched.groupby('Ref_Class_Mapped')['IoU'].agg(['mean', 'sum', 'count'])
 
         rows = []
         for c in classes:
             tp = cm.loc[c, c]
             fp = cm[c].sum() - tp
             fn = cm.loc[c].sum() - tp
+            support = int(cm.loc[c].sum())
             precision = tp / (tp + fp) if (tp + fp) else 0.0
             recall = tp / (tp + fn) if (tp + fn) else 0.0
             f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
             accuracy = tp / (tp + fp + fn) if (tp + fp + fn) else 0.0
-            mave = ave_by_class.get(c, np.nan)
             rows.append({
-                'Class': c, 'TP': tp, 'FP': fp, 'FN': fn, 'Support': int(cm.loc[c].sum()),
+                'Class': c, 'TP': tp, 'FP': fp, 'FN': fn, 'Support': support,
                 'Precision': precision, 'Recall': recall, 'F1': f1, 'Accuracy': accuracy,
-                'mAVE': mave,
+                'mAVE': ave_by_class.get(c, np.nan),
+                'N_Matched': int(iou_stats['count'].get(c, 0)),
+                'mIoU': iou_stats['mean'].get(c, np.nan),
+                'mIoU_GT': iou_stats['sum'].get(c, 0.0) / support if support else np.nan,
             })
 
         metrics_df = pd.DataFrame(rows)
-
         tp_all, fp_all, fn_all = metrics_df[['TP', 'FP', 'FN']].sum()
+        total_support = int(metrics_df['Support'].sum())
         p = tp_all / (tp_all + fp_all) if (tp_all + fp_all) else 0.0
         r = tp_all / (tp_all + fn_all) if (tp_all + fn_all) else 0.0
+
         metrics_df = pd.concat([metrics_df, pd.DataFrame([{
             'Class': 'OVERALL', 'TP': tp_all, 'FP': fp_all, 'FN': fn_all,
-            'Support': int(metrics_df['Support'].sum()),
+            'Support': total_support,
             'Precision': p, 'Recall': r,
             'F1': 2 * p * r / (p + r) if (p + r) else 0.0,
             'Accuracy': tp_all / (tp_all + fp_all + fn_all) if (tp_all + fp_all + fn_all) else 0.0,
             'mAVE': df_tp['AVE'].mean(),
+            'N_Matched': len(matched),
+            'mIoU': matched['IoU'].mean(),
+            'mIoU_GT': matched['IoU'].sum() / total_support if total_support else np.nan,
         }])], ignore_index=True)
 
         os.makedirs(output_dir, exist_ok=True)

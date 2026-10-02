@@ -3,9 +3,11 @@ import pandas as pd
 from DataParsers.AbstractDataParser import AbstractDataParser
 from tools.functions import load_json, quaternion_to_rpy
 
-class SystemDataParser(AbstractDataParser):
-    def __init__(self, filepath):
+class DetrDataParser(AbstractDataParser):
+
+    def __init__(self, filepath, score_threshold = 0.0):
         super().__init__(filepath)
+        self.score_threshold = score_threshold
         self.columns = ['Sample token', 'Sensor ID', 'Timestamp',
                         'PosX', 'PosY', 'PosZ',
                         'Width', 'Length', 'Height',
@@ -44,13 +46,13 @@ class SystemDataParser(AbstractDataParser):
         self._filter_detections()
 
     def _filter_detections(self):
-        self.df = self.df[self.df['Probability'] >= 0.5].reset_index(drop=True)
+        self.df = self.df[self.df['Probability'] >= self.score_threshold].reset_index(drop=True)
 
 
 
 if __name__ == "__main__":
     filepath = r"D:\Programiki do nauki i inne\Szkolne\Studia\Projekt inzynierski\Logi NuScenes\scene-0103\results_nusc_detr3d.json"
-    test_parser = SystemDataParser(filepath)
+    test_parser = DetrDataParser(filepath)
     test_parser.parse()
 
     db = 0

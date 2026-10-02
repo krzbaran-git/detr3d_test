@@ -1,22 +1,21 @@
 import numpy as np
 import pandas as pd
 import os
-from pyquaternion import Quaternion
-from scipy.spatial.transform import Rotation
-from scipy.optimize import linear_sum_assignment
 from joblib import Parallel, delayed
 
 from tools.functions import load_json
-from tools.PascalMeasure import PascalMeasure3D
 from tools.CameraVisualizer import CameraVisualizer
 from tools.MapBEVVisualizer import MapBEVVisualizer
 from tools.ObjectsMatcher import ObjectsMatcher
 from Sensors.Sensors import LidarSensor, CameraSensor, RadarSensor
-from DataParsers.SystemDataParser import SystemDataParser
+from DataParsers.DetrDataParser import DetrDataParser
+from DataParsers.AdatrackDataParser import AdatrackDataParser
 from DataParsers.LabelingDataParser import LabelingDataParser
 
 class Scene:
-    def __init__(self, scene_path):
+    def __init__(self, scene_path, cfg):
+        self.cfg = cfg
+
         # Initialization parameteres (from scene.json file)
         self.scene_path = scene_path
         self.scene_token = None
@@ -29,9 +28,11 @@ class Scene:
         self.sensors = None
         self.ego_pose = None
         self.sample_data = None
-        self.system_data = None
-        self.labeling_data = None
-        self.paired_df = None
+        self.detr_data = None
+        self.adatrack_data = None
+        self.ref_data = None
+        self.detr_paired_df = None
+        self.adatrack_paired_df = None
 
 
     # Building data
@@ -39,17 +40,24 @@ class Scene:
         self._get_scene_parameters()
         self._get_sensors()
         self._get_ego_pose()
-        self._parse_system_data()
+        self._parse_detr_data()
+        self._parse_adatrack_data()
         self._parse_labeling_data()
+        self._enrich_with_sample_data()
         self._enrich_with_cameras()
         # self.global_to_ego()
 
-    def _parse_system_data(self):
+    def _parse_detr_data(self):
         path = self.scene_path + '/results_nusc_detr3d.json'
-        parser = SystemDataParser(path)
+        detr_parser = DetrDataParser(path, self.cfg.detr_score_threshold)
+        detr_parser.parse()
+        self.detr_data = detr_parser.df
+
+    def _parse_adatrack_data(self):
+        path = self.scene_path + '/results_nusc.json'
+        parser = AdatrackDataParser(path, self.cfg.adatrack_score_threshold)
         parser.parse()
-        self.system_data = parser.df
-        self._enrich_with_sample_data()
+        self.adatrack_data = parser.df
 
     def _enrich_with_sample_data(self):
         timestamp_lookup = {}
@@ -61,8 +69,11 @@ class Scene:
                 timestamp_lookup[token] = entry['timestamp']
                 sensor_lookup[token] = entry['calibrated_sensor_token']
 
-        self.system_data['Timestamp'] = self.system_data['Sample token'].map(timestamp_lookup)
-        self.system_data['Sensor ID'] = self.system_data['Sample token'].map(sensor_lookup)
+        self.detr_data['Timestamp'] = self.detr_data['Sample token'].map(timestamp_lookup)
+        self.detr_data['Sensor ID'] = self.detr_data['Sample token'].map(sensor_lookup)
+
+        self.adatrack_data['Timestamp'] = self.adatrack_data['Sample token'].map(timestamp_lookup)
+        self.adatrack_data['Sensor ID'] = self.adatrack_data['Sample token'].map(sensor_lookup)
 
     def _enrich_with_cameras(self):
         cam_lookup = {}
@@ -75,8 +86,10 @@ class Scene:
                 cam_lookup.setdefault(token, {})[sensor.channel] = entry['calibrated_sensor_token']
             ego_lookup.setdefault(token, {})[entry['calibrated_sensor_token']] = entry['ego_pose_token']
 
-        self.system_data['Cameras'] = self.system_data['Sample token'].map(cam_lookup)
-        self.system_data['Ego poses'] = self.system_data['Sample token'].map(ego_lookup)
+        self.detr_data['Cameras'] = self.detr_data['Sample token'].map(cam_lookup)
+        self.detr_data['Ego poses'] = self.detr_data['Sample token'].map(ego_lookup)
+        self.adatrack_data['Cameras'] = self.adatrack_data['Sample token'].map(cam_lookup)
+        self.adatrack_data['Ego poses'] = self.adatrack_data['Sample token'].map(ego_lookup)
         self.labeling_data['Cameras'] = self.labeling_data['Sample token'].map(cam_lookup)
         self.labeling_data['Ego poses'] = self.labeling_data['Sample token'].map(ego_lookup)
 
@@ -147,45 +160,25 @@ class Scene:
     def _find_by_token(self, data: list[dict], token_name: str, token_value: str) -> dict | None:
         return next((item for item in data if item[token_name] == token_value), None)
 
-    def global_to_ego(self):
-        ego_token_lookup = {
-            entry['sample_token']: entry['ego_pose_token']
-            for entry in self.sample_data
-        }
-
-        def transform(row):
-            ego_pose_token = ego_token_lookup[row['Sample token']]
-            ego = self.ego_pose[ego_pose_token]
-            r = Rotation.from_quat([*ego['rotation'][1:], ego['rotation'][0]])
-
-            # pozycja
-            point = np.array([row['PosX'], row['PosY'], row['PosZ']]) - np.array(ego['translation'])
-            pos_ego = r.inv().apply(point)
-
-            # orientacja
-            r_obj = Rotation.from_euler('ZYX', [row['Yaw'], row['Pitch'], row['Roll']])
-            r_obj_ego = r.inv() * r_obj
-            yaw, pitch, roll = r_obj_ego.as_euler('ZYX')
-
-            return pd.Series([*pos_ego, yaw, pitch, roll], index=['PosX', 'PosY', 'PosZ', 'Yaw', 'Pitch', 'Roll'])
-
-        for df in [self.system_data, self.labeling_data]:
-            if df is not None:
-                df[['PosX', 'PosY', 'PosZ', 'Yaw', 'Pitch', 'Roll']] = df.apply(transform, axis=1)
-
-
     # Data evaluation
-    def build_pairs(self):
-        matcher = ObjectsMatcher()
+    def build_pairs(self, detections: pd.DataFrame) -> pd.DataFrame:
+        matcher = ObjectsMatcher(self.cfg)
+        tokens = detections['Sample token'].unique()
+
+        sys_samples = {t: detections[detections['Sample token'] == t].reset_index(drop=True)
+                       for t in tokens}
+        ref_samples = {t: self.labeling_data[self.labeling_data['Sample token'] == t].reset_index(drop=True)
+                       for t in tokens}
+
+        results = Parallel(n_jobs=self.cfg.n_jobs)(
+            delayed(matcher.match)(sys_samples[t], ref_samples[t]) for t in tokens
+        )
         records = []
 
-        for sample_token in self.system_data['Sample token'].unique():
-            sys_sample = self.system_data[self.system_data['Sample token'] == sample_token].reset_index(drop=True)
-            ref_sample = self.labeling_data[self.labeling_data['Sample token'] == sample_token].reset_index(drop=True)
+        for sample_token, (pairs, unmatched_sys, unmatched_ref) in zip(tokens, results):
+            sys_sample = sys_samples[sample_token]
+            ref_sample = ref_samples[sample_token]
 
-            pairs, unmatched_sys, unmatched_ref = matcher.match(sys_sample, ref_sample)
-
-            # pary
             for s, r, iou in pairs:
                 sys_row = sys_sample.iloc[s]
                 ref_row = ref_sample.iloc[r]
@@ -198,7 +191,7 @@ class Scene:
                     'Sample token': sample_token,
                     'Paired': True,
                     'Distance': dist,
-                    'PascalMeasure': iou,
+                    'IoU': iou,
                     'Sys_PosX': sys_row['PosX'], 'Sys_PosY': sys_row['PosY'], 'Sys_PosZ': sys_row['PosZ'],
                     'Sys_Yaw': sys_row['Yaw'], 'Sys_Pitch': sys_row['Pitch'], 'Sys_Roll': sys_row['Roll'],
                     'Sys_Width': sys_row['Width'], 'Sys_Length': sys_row['Length'], 'Sys_Height': sys_row['Height'],
@@ -211,14 +204,14 @@ class Scene:
                     'Ref_Class': ref_row['Class'],
                 })
 
-            # Sys bez pary
+            # Unpaired sys detections
             for s in unmatched_sys:
                 sys_row = sys_sample.iloc[s]
                 records.append({
                     'Sample token': sample_token,
                     'Paired': False,
                     'Distance': None,
-                    'PascalMeasure': None,
+                    'IoU': None,
                     'Sys_PosX': sys_row['PosX'], 'Sys_PosY': sys_row['PosY'], 'Sys_PosZ': sys_row['PosZ'],
                     'Sys_Yaw': sys_row['Yaw'], 'Sys_Pitch': sys_row['Pitch'], 'Sys_Roll': sys_row['Roll'],
                     'Sys_Width': sys_row['Width'], 'Sys_Length': sys_row['Length'], 'Sys_Height': sys_row['Height'],
@@ -231,14 +224,14 @@ class Scene:
                     'Ref_Class': None,
                 })
 
-            # Ref bez pary
+            # Unpaired reference objects
             for r in unmatched_ref:
                 ref_row = ref_sample.iloc[r]
                 records.append({
                     'Sample token': sample_token,
                     'Paired': False,
                     'Distance': None,
-                    'PascalMeasure': None,
+                    'IoU': None,
                     'Sys_PosX': None, 'Sys_PosY': None, 'Sys_PosZ': None,
                     'Sys_Yaw': None, 'Sys_Pitch': None, 'Sys_Roll': None,
                     'Sys_Width': None, 'Sys_Length': None, 'Sys_Height': None,
@@ -251,36 +244,13 @@ class Scene:
                     'Ref_Class': ref_row['Class'],
                 })
 
-        self.paired_df = pd.DataFrame(records)
-
-    def _calculate_pascal_measure(self, n_samples: int = 10_000, n_jobs: int = -1):
-
-        def _compute_row_iou(row):
-            obj1 = {
-                'PosX': row['Sys_PosX'], 'PosY': row['Sys_PosY'], 'PosZ': row['Sys_PosZ'],
-                'Yaw': row['Sys_Yaw'], 'Pitch': row['Sys_Pitch'], 'Roll': row['Sys_Roll'],
-                'Width': row['Sys_Width'], 'Length': row['Sys_Length'], 'Height': row['Sys_Height'],
-            }
-            obj2 = {
-                'PosX': row['Ref_PosX'], 'PosY': row['Ref_PosY'], 'PosZ': row['Ref_PosZ'],
-                'Yaw': row['Ref_Yaw'], 'Pitch': row['Ref_Pitch'], 'Roll': row['Ref_Roll'],
-                'Width': row['Ref_Width'], 'Length': row['Ref_Length'], 'Height': row['Ref_Height'],
-            }
-            return PascalMeasure3D(obj1, obj2, n_samples).compute_iou()
-
-        paired = self.paired_df[self.paired_df['Paired'] == True].copy()
-        rows = [row for _, row in paired.iterrows()]
-
-        ious = Parallel(n_jobs=n_jobs, backend='threading')(delayed(_compute_row_iou)(row) for row in rows)
-        self.paired_df.loc[paired.index, 'PascalMeasure'] = ious
-
+        return pd.DataFrame(records)
 
     # Visualization
-    def visualize_scene(self, output_path: str):
-        # kolejność klatek po timestampie
+    def visualize_scene(self, output_path: str, paired_df: pd.DataFrame, visualizer_type = CameraVisualizer):
         frame_lookup = self._build_frame_lookup()
 
-        for sample_token in self.paired_df['Sample token'].unique():
+        for sample_token in paired_df['Sample token'].unique():
             frame_name = frame_lookup[sample_token]
 
             sample_entries = {
@@ -291,28 +261,23 @@ class Scene:
                    and isinstance(self.sensors.get(entry['calibrated_sensor_token']), CameraSensor)
             }
 
-            paired = self.paired_df[
-                (self.paired_df['Sample token'] == sample_token) & (self.paired_df['Paired'] == True)]
-            unpaired_sys = self.paired_df[
-                (self.paired_df['Sample token'] == sample_token) & (self.paired_df['Paired'] == False) & (
-                    self.paired_df['Sys_PosX'].notna())]
-            unpaired_ref = self.paired_df[
-                (self.paired_df['Sample token'] == sample_token) & (self.paired_df['Paired'] == False) & (
-                    self.paired_df['Ref_PosX'].notna())]
+            sample_df = paired_df[paired_df['Sample token'] == sample_token]
+            paired = sample_df[sample_df['Paired'] == True]
+            unpaired_sys = sample_df[(sample_df['Paired'] == False) & (sample_df['Sys_PosX'].notna())]
+            unpaired_ref = sample_df[(sample_df['Paired'] == False) & (sample_df['Ref_PosX'].notna())]
 
             for channel, entry in sample_entries.items():
                 camera = self.sensors[entry['calibrated_sensor_token']]
                 ego = self.ego_pose[entry['ego_pose_token']]
                 image_path = os.path.join(self.scene_path, self.scene_name, entry['filename'])
 
-                vis = CameraVisualizer(camera, image_path)
+                vis = visualizer_type(camera, image_path)
                 vis.render(paired, unpaired_sys, unpaired_ref, ego)
                 vis.save(os.path.join(output_path, channel, f'{frame_name}.jpg'))
 
-        self._visualize_map_bev(output_path, frame_lookup)
+        self._visualize_map_bev(output_path, frame_lookup, paired_df)
 
     def _build_frame_lookup(self):
-        # sample_token → timestamp (z key frames), potem numeracja po czasie
         ts = {}
         for entry in self.sample_data:
             if entry['is_key_frame'] and entry['sample_token'] not in ts:
@@ -320,9 +285,9 @@ class Scene:
         ordered = sorted(ts, key=lambda t: ts[t])
         return {token: f'Frame_{i + 1}' for i, token in enumerate(ordered)}
 
-    def _visualize_map_bev(self, output_path: str, frame_lookup: dict):
+    def _visualize_map_bev(self, output_path: str, frame_lookup: dict, paired_df: pd.DataFrame):
         map_path = self._get_map_path()
-        bev = MapBEVVisualizer(self.paired_df, map_path, self.ego_pose, self.sample_data)
+        bev = MapBEVVisualizer(paired_df, map_path, self.ego_pose, self.sample_data)
         bev.save_all(os.path.join(output_path, 'MAP_BEV'), frame_lookup)
 
 

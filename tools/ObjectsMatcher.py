@@ -1,71 +1,66 @@
 import numpy as np
 import pandas as pd
-from tools.PascalMeasure import PascalMeasure3D
+
+from tools.IoU import IoU3D
 
 
 class ObjectsMatcher:
 
-    CLASS_PARAMS = {
-        'car':          (3.0, True),
-        'truck':        (3.0, True),
-        'bus':          (3.0, True),
-        'bicycle':      (2.0, True),
-        'motorcycle':   (2.0, True),
-        'pedestrian':   (1.0, False),
-        'traffic_cone': (1.0, False),
-    }
-    DEFAULT_PARAMS = (1.5, True)
-    IOU_SAMPLES    = 10000
+    def __init__(self, cfg):
+        self.class_params   = cfg.class_params
+        self.default_params = cfg.default_params
+        self.heading_limit  = cfg.heading_limit
+        self.iou_samples    = cfg.iou_samples
 
-    def match(self, sys_objects: pd.DataFrame, ref_objects: pd.DataFrame):
-        sys = sys_objects.reset_index(drop=True)
-        ref = ref_objects.reset_index(drop=True)
+    def match(self, sys_df: pd.DataFrame, ref_df: pd.DataFrame):
+        sys_a = sys_df[IoU3D.COLS].to_numpy(float)
+        ref_a = ref_df[IoU3D.COLS].to_numpy(float)
+        ns, nr = len(sys_a), len(ref_a)
 
-        candidates = []
-        for s in range(len(sys)):
-            sys_obj = sys.iloc[s]
-            dist_thr, head_on = self.CLASS_PARAMS.get(sys_obj['Class'], self.DEFAULT_PARAMS)
+        if ns == 0 or nr == 0:
+            return [], list(range(ns)), list(range(nr))
 
-            for r in range(len(ref)):
-                ref_obj = ref.iloc[r]
+        s_idx, r_idx = self._candidates(sys_df, sys_a, ref_a)
+        if len(s_idx) == 0:
+            return [], list(range(ns)), list(range(nr))
 
-                if not self._distance_filter(sys_obj, ref_obj, dist_thr):
-                    continue
-                if head_on and not self._heading_filter(sys_obj, ref_obj):
-                    continue
+        iou = IoU3D.compute_batch(sys_a[s_idx], ref_a[r_idx], self.iou_samples)
+        pairs, matched_s, matched_r = self._greedy_by_iou(s_idx, r_idx, iou)
 
-                iou = PascalMeasure3D(sys_obj, ref_obj, self.IOU_SAMPLES).compute_iou()
-                if iou > 0:
-                    candidates.append((iou, s, r))
-
-        candidates = self._sort_by_iou(candidates)
-
-        matched_sys, matched_ref = set(), set()
-        pairs = []
-        for iou, s, r in candidates:
-            if s in matched_sys or r in matched_ref:
-                continue
-            matched_sys.add(s)
-            matched_ref.add(r)
-            pairs.append((s, r, iou))
-
-        unmatched_sys = [s for s in range(len(sys)) if s not in matched_sys]
-        unmatched_ref = [r for r in range(len(ref)) if r not in matched_ref]
-
+        unmatched_sys = [s for s in range(ns) if s not in matched_s]
+        unmatched_ref = [r for r in range(nr) if r not in matched_r]
         return pairs, unmatched_sys, unmatched_ref
 
-    def _sort_by_iou(self, candidates: list) -> list:
-        return sorted(candidates, key=lambda x: x[0], reverse=True)
+    def _candidates(self, sys_df, sys_a, ref_a):
+        params = [self.class_params.get(c, self.default_params) for c in sys_df['Class']]
+        thr = np.array([p[0] for p in params])
+        head = np.array([p[1] for p in params])
 
-    def _heading_filter(self, sys_obj, ref_obj) -> bool:
-        diff = sys_obj['Yaw'] - ref_obj['Yaw']
-        diff = np.arctan2(np.sin(diff), np.cos(diff))
-        return abs(diff) <= np.pi / 2
+        dist = self._distance_matrix(sys_a, ref_a)
+        dyaw = self._heading_diff_matrix(sys_a, ref_a)
 
-    def _distance_filter(self, sys_obj, ref_obj, threshold: float) -> bool:
-        dist = np.sqrt(
-            (sys_obj['PosX'] - ref_obj['PosX'])**2 +
-            (sys_obj['PosY'] - ref_obj['PosY'])**2 +
-            (sys_obj['PosZ'] - ref_obj['PosZ'])**2
-        )
-        return dist <= threshold
+        ok = (dist <= thr[:, None]) & (~head[:, None] | (dyaw <= self.heading_limit))
+        return np.nonzero(ok)
+
+    @staticmethod
+    def _distance_matrix(sys_a, ref_a):
+        return np.linalg.norm(sys_a[:, None, :3] - ref_a[None, :, :3], axis=2)
+
+    @staticmethod
+    def _heading_diff_matrix(sys_a, ref_a):
+        d = sys_a[:, None, 3] - ref_a[None, :, 3]
+        return np.abs(np.arctan2(np.sin(d), np.cos(d)))
+
+    @staticmethod
+    def _greedy_by_iou(s_idx, r_idx, iou):
+        matched_s, matched_r, pairs = set(), set(), []
+        for k in np.argsort(-iou):
+            if iou[k] <= 0:
+                break
+            s, r = int(s_idx[k]), int(r_idx[k])
+            if s in matched_s or r in matched_r:
+                continue
+            matched_s.add(s)
+            matched_r.add(r)
+            pairs.append((s, r, float(iou[k])))
+        return pairs, matched_s, matched_r

@@ -9,7 +9,7 @@ from Sensors.Sensors import CameraSensor
 class CameraVisualizer:
     def __init__(self, camera: CameraSensor, image_path: str):
         self.camera = camera
-        self.img    = cv2.imread(image_path)
+        self.img = cv2.imread(image_path)
 
     def render(self, paired: pd.DataFrame, unpaired_sys: pd.DataFrame, unpaired_ref: pd.DataFrame, ego: dict):
         for _, row in paired.iterrows():
@@ -17,7 +17,7 @@ class CameraVisualizer:
             ref_pixels = self.project_object(self.row_to_obj(row, 'Ref'), ego)
             self.draw_box(sys_pixels, color=(0, 0, 255))
             self.draw_box(ref_pixels, color=(0, 255, 0))
-            self.draw_match(sys_pixels, ref_pixels, iou=row.get('PascalMeasure'))
+            self.draw_match(sys_pixels, ref_pixels, iou=row.get('IoU'))
 
         for _, row in unpaired_sys.iterrows():
             self.draw_box(self.project_object(self.row_to_obj(row, 'Sys'), ego), color=(255, 0, 0))
