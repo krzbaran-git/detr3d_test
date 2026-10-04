@@ -11,16 +11,19 @@ class CameraVisualizer:
         self.camera = camera
         self.img = cv2.imread(image_path)
 
-    def render(self, paired: pd.DataFrame, unpaired_sys: pd.DataFrame, unpaired_ref: pd.DataFrame, ego: dict):
+    def render(self, paired, unpaired_sys, unpaired_ref, ego):
         for _, row in paired.iterrows():
             sys_pixels = self.project_object(self.row_to_obj(row, 'Sys'), ego)
             ref_pixels = self.project_object(self.row_to_obj(row, 'Ref'), ego)
             self.draw_box(sys_pixels, color=(0, 0, 255))
             self.draw_box(ref_pixels, color=(0, 255, 0))
             self.draw_match(sys_pixels, ref_pixels, iou=row.get('IoU'))
+            self.draw_label(sys_pixels, self._track_text(row), color=(0, 0, 255))
 
         for _, row in unpaired_sys.iterrows():
-            self.draw_box(self.project_object(self.row_to_obj(row, 'Sys'), ego), color=(255, 0, 0))
+            sys_pixels = self.project_object(self.row_to_obj(row, 'Sys'), ego)
+            self.draw_box(sys_pixels, color=(255, 0, 0))
+            self.draw_label(sys_pixels, self._track_text(row), color=(255, 0, 0))
 
         for _, row in unpaired_ref.iterrows():
             self.draw_box(self.project_object(self.row_to_obj(row, 'Ref'), ego), color=(0, 255, 255))
@@ -51,6 +54,24 @@ class CameraVisualizer:
                    (sys_center[1] + ref_center[1]) // 2)
             cv2.putText(self.img, f'{iou:.2f}', mid,
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+    def draw_label(self, pixels, text, color=(0, 0, 255)):
+        if pixels is None or text is None:
+            return
+        x = int(pixels[:, 0].mean())
+        y = int(pixels[:, 1].min()) - 6
+        cv2.putText(self.img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3)
+        cv2.putText(self.img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 1)
+
+    @staticmethod
+    def _track_text(row):
+        tid = row.get('Sys_TrackID')
+        if tid is None or pd.isna(tid):
+            return None
+        try:
+            return f'ID {int(tid)}'
+        except (ValueError, TypeError):
+            return f'ID {tid}'
 
     def project_object(self, obj: dict, ego: dict) -> np.ndarray | None:
         corners_global = self._get_box_corners(obj)

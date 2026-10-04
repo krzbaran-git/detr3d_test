@@ -6,16 +6,18 @@ from tools.functions import load_json, quaternion_to_rpy
 
 
 class LabelingDataParser(AbstractDataParser):
-    def __init__(self, filepath):
+    def __init__(self, filepath, min_pts = 0, class_map = None, class_range = None, default_range = 50.0):
         super().__init__(filepath)
         self.columns = ['Sample token', 'PosX', 'PosY', 'PosZ',
                         'Width', 'Length', 'Height',
                         'Yaw', 'Pitch', 'Roll',
-                        'VelX', 'VelY', 'Class']
+                        'VelX', 'VelY', 'Class', 'Instance', 'NumPts']
+        self.min_pts, self.class_map = min_pts, class_map or {}
+        self.class_range, self.default_range = class_range, default_range
         self.raw_data = load_json(filepath)
         self.df = pd.DataFrame(columns=self.columns)
 
-    def parse(self, valid_tokens: set = None, timestamp_lookup: dict = None):
+    def parse(self, valid_tokens: set = None, timestamp_lookup: dict = None, ego_xy = None):
         ann_by_token = {a['token']: a for a in self.raw_data}
         records = []
 
@@ -40,10 +42,21 @@ class LabelingDataParser(AbstractDataParser):
                 'VelX':   vx,
                 'VelY':   vy,
                 'Class':  annotation['category_name'],
+                'Instance': annotation['instance_token'],
+                'NumPts': annotation['num_lidar_pts'] + annotation['num_radar_pts']
             })
 
         self.df = pd.DataFrame(records, columns=self.columns)
         self.df = self.df.sort_values('Sample token').reset_index(drop=True)
+        self.filter_annotations(ego_xy)
+
+    def filter_annotations(self, ego_xy):
+        df     = self.df
+        mapped = df['Class'].map(self.class_map)
+        keep   = mapped.notna() & (df['NumPts'] >= self.min_pts)
+        df, mapped = df[keep], mapped[keep]
+        self.df = self.filter_by_range(df, mapped, ego_xy,
+                                       self.class_range, self.default_range)
 
     @staticmethod
     def _box_velocity(ann, ann_by_token, ts_lookup, max_time_diff=1.5):

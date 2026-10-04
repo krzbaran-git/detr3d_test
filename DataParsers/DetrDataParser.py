@@ -18,7 +18,7 @@ class DetrDataParser(AbstractDataParser):
         self.raw_data = load_json(filepath)
         self.df = pd.DataFrame(columns=self.columns)
 
-    def parse(self):
+    def parse(self, ego_xy=None, class_range=None, default_range=None):
         records = []
         for sample_token, detections in self.raw_data['results'].items():
             for detection in detections:
@@ -44,6 +44,8 @@ class DetrDataParser(AbstractDataParser):
 
         self.df = pd.DataFrame(records, columns=self.columns)
         self._filter_detections()
+        self.df = self.filter_by_range(self.df, self.df['Class'], ego_xy,
+                                       class_range, default_range)
 
     def _filter_detections(self):
         self.df = self.df[self.df['Probability'] >= self.score_threshold].reset_index(drop=True)

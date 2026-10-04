@@ -3,6 +3,7 @@ import pandas as pd
 import os
 from joblib import Parallel, delayed
 
+from config import Config
 from tools.functions import load_json
 from tools.CameraVisualizer import CameraVisualizer
 from tools.MapBEVVisualizer import MapBEVVisualizer
@@ -13,7 +14,7 @@ from DataParsers.AdatrackDataParser import AdatrackDataParser
 from DataParsers.LabelingDataParser import LabelingDataParser
 
 class Scene:
-    def __init__(self, scene_path, cfg):
+    def __init__(self, scene_path, cfg, class_map):
         self.cfg = cfg
 
         # Initialization parameteres (from scene.json file)
@@ -23,10 +24,12 @@ class Scene:
         self.first_sample_token = None
         self.last_sample_token = None
         self.scene_name = None
+        self.class_map = class_map
 
         # Data
         self.sensors = None
         self.ego_pose = None
+        self.ego_xy = None
         self.sample_data = None
         self.detr_data = None
         self.adatrack_data = None
@@ -40,23 +43,23 @@ class Scene:
         self._get_scene_parameters()
         self._get_sensors()
         self._get_ego_pose()
+        self._build_ego_xy()
         self._parse_detr_data()
         self._parse_adatrack_data()
         self._parse_labeling_data()
         self._enrich_with_sample_data()
         self._enrich_with_cameras()
-        # self.global_to_ego()
 
     def _parse_detr_data(self):
         path = self.scene_path + '/results_nusc_detr3d.json'
         detr_parser = DetrDataParser(path, self.cfg.detr_score_threshold)
-        detr_parser.parse()
+        detr_parser.parse(self.ego_xy, self.cfg.class_range, self.cfg.default_range)
         self.detr_data = detr_parser.df
 
     def _parse_adatrack_data(self):
         path = self.scene_path + '/results_nusc.json'
         parser = AdatrackDataParser(path, self.cfg.adatrack_score_threshold)
-        parser.parse()
+        parser.parse(self.ego_xy, self.cfg.class_range, self.cfg.default_range)
         self.adatrack_data = parser.df
 
     def _enrich_with_sample_data(self):
@@ -95,7 +98,8 @@ class Scene:
 
     def _parse_labeling_data(self):
         path = self.scene_path + f'/{self.scene_name}' + '/v1.0-trainval/sample_annotation.json'
-        parser = LabelingDataParser(path)
+        parser = LabelingDataParser(path, self.cfg.min_gt_pts, self.class_map,
+                                    self.cfg.class_range, self.cfg.default_range)
 
         valid_tokens = set()
         timestamp_lookup = {}
@@ -104,7 +108,7 @@ class Scene:
                 valid_tokens.add(entry['sample_token'])
                 timestamp_lookup.setdefault(entry['sample_token'], entry['timestamp'])
 
-        parser.parse(valid_tokens=valid_tokens, timestamp_lookup=timestamp_lookup)
+        parser.parse(valid_tokens=valid_tokens, timestamp_lookup=timestamp_lookup, ego_xy=self.ego_xy)
         self.labeling_data = parser.df
 
     def _get_sensors(self):
@@ -142,6 +146,14 @@ class Scene:
         ego_pose = load_json(ego_pose_path)
         self.ego_pose = {entry['token']: entry for entry in ego_pose}
 
+    def _build_ego_xy(self):
+        ego_xy = {}
+        for e in self.sample_data:
+            if e['is_key_frame'] and e['sample_token'] not in ego_xy:
+                ego_xy[e['sample_token']] = tuple(
+                    self.ego_pose[e['ego_pose_token']]['translation'][:2])
+        self.ego_xy = ego_xy
+
     def _get_map_path(self):
         map_json = load_json(self.scene_path + f'/{self.scene_name}' + '/v1.0-trainval/map.json')
         entry = next(m for m in map_json if self.log_token in m['log_tokens'])
@@ -173,78 +185,68 @@ class Scene:
         results = Parallel(n_jobs=self.cfg.n_jobs)(
             delayed(matcher.match)(sys_samples[t], ref_samples[t]) for t in tokens
         )
-        records = []
 
+        def track_id(row):
+            return row['TrackID'] if 'TrackID' in row.index else None
+
+        def sys_fields(row):
+            return {
+                'Sys_PosX': row['PosX'], 'Sys_PosY': row['PosY'], 'Sys_PosZ': row['PosZ'],
+                'Sys_Yaw': row['Yaw'], 'Sys_Pitch': row['Pitch'], 'Sys_Roll': row['Roll'],
+                'Sys_Width': row['Width'], 'Sys_Length': row['Length'], 'Sys_Height': row['Height'],
+                'Sys_VelX': row['VelX'], 'Sys_VelY': row['VelY'],
+                'Sys_Class': row['Class'], 'Sys_Probability': row['Probability'],
+                'Sys_TrackID': track_id(row),
+            }
+
+        def ref_fields(row):
+            return {
+                'Ref_PosX': row['PosX'], 'Ref_PosY': row['PosY'], 'Ref_PosZ': row['PosZ'],
+                'Ref_Yaw': row['Yaw'], 'Ref_Pitch': row['Pitch'], 'Ref_Roll': row['Roll'],
+                'Ref_Width': row['Width'], 'Ref_Length': row['Length'], 'Ref_Height': row['Height'],
+                'Ref_VelX': row['VelX'], 'Ref_VelY': row['VelY'],
+                'Ref_Class': row['Class'],
+                'Ref_Instance': row['Instance'] if 'Instance' in row.index else None,
+            }
+
+        SYS_KEYS = ['Sys_PosX', 'Sys_PosY', 'Sys_PosZ', 'Sys_Yaw', 'Sys_Pitch', 'Sys_Roll',
+                    'Sys_Width', 'Sys_Length', 'Sys_Height', 'Sys_VelX', 'Sys_VelY',
+                    'Sys_Class', 'Sys_Probability', 'Sys_TrackID']
+        REF_KEYS = ['Ref_PosX', 'Ref_PosY', 'Ref_PosZ', 'Ref_Yaw', 'Ref_Pitch', 'Ref_Roll',
+                    'Ref_Width', 'Ref_Length', 'Ref_Height', 'Ref_VelX', 'Ref_VelY',
+                    'Ref_Class', 'Ref_Instance']
+        empty_sys = dict.fromkeys(SYS_KEYS)
+        empty_ref = dict.fromkeys(REF_KEYS)
+
+        records = []
         for sample_token, (pairs, unmatched_sys, unmatched_ref) in zip(tokens, results):
             sys_sample = sys_samples[sample_token]
             ref_sample = ref_samples[sample_token]
 
             for s, r, iou in pairs:
-                sys_row = sys_sample.iloc[s]
-                ref_row = ref_sample.iloc[r]
-                dist = np.sqrt(
-                    (sys_row['PosX'] - ref_row['PosX']) ** 2 +
-                    (sys_row['PosY'] - ref_row['PosY']) ** 2 +
-                    (sys_row['PosZ'] - ref_row['PosZ']) ** 2
-                )
-                records.append({
-                    'Sample token': sample_token,
-                    'Paired': True,
-                    'Distance': dist,
-                    'IoU': iou,
-                    'Sys_PosX': sys_row['PosX'], 'Sys_PosY': sys_row['PosY'], 'Sys_PosZ': sys_row['PosZ'],
-                    'Sys_Yaw': sys_row['Yaw'], 'Sys_Pitch': sys_row['Pitch'], 'Sys_Roll': sys_row['Roll'],
-                    'Sys_Width': sys_row['Width'], 'Sys_Length': sys_row['Length'], 'Sys_Height': sys_row['Height'],
-                    'Sys_VelX': sys_row['VelX'], 'Sys_VelY': sys_row['VelY'],
-                    'Sys_Class': sys_row['Class'], 'Sys_Probability': sys_row['Probability'],
-                    'Ref_PosX': ref_row['PosX'], 'Ref_PosY': ref_row['PosY'], 'Ref_PosZ': ref_row['PosZ'],
-                    'Ref_Yaw': ref_row['Yaw'], 'Ref_Pitch': ref_row['Pitch'], 'Ref_Roll': ref_row['Roll'],
-                    'Ref_Width': ref_row['Width'], 'Ref_Length': ref_row['Length'], 'Ref_Height': ref_row['Height'],
-                    'Ref_VelX': ref_row['VelX'], 'Ref_VelY': ref_row['VelY'],
-                    'Ref_Class': ref_row['Class'],
-                })
+                sys_row, ref_row = sys_sample.iloc[s], ref_sample.iloc[r]
+                dist = np.sqrt((sys_row['PosX'] - ref_row['PosX']) ** 2 +
+                               (sys_row['PosY'] - ref_row['PosY']) ** 2 +
+                               (sys_row['PosZ'] - ref_row['PosZ']) ** 2)
+                records.append({'Sample token': sample_token, 'Paired': True,
+                                'Distance': dist, 'IoU': iou,
+                                **sys_fields(sys_row), **ref_fields(ref_row)})
 
-            # Unpaired sys detections
             for s in unmatched_sys:
-                sys_row = sys_sample.iloc[s]
-                records.append({
-                    'Sample token': sample_token,
-                    'Paired': False,
-                    'Distance': None,
-                    'IoU': None,
-                    'Sys_PosX': sys_row['PosX'], 'Sys_PosY': sys_row['PosY'], 'Sys_PosZ': sys_row['PosZ'],
-                    'Sys_Yaw': sys_row['Yaw'], 'Sys_Pitch': sys_row['Pitch'], 'Sys_Roll': sys_row['Roll'],
-                    'Sys_Width': sys_row['Width'], 'Sys_Length': sys_row['Length'], 'Sys_Height': sys_row['Height'],
-                    'Sys_VelX': sys_row['VelX'], 'Sys_VelY': sys_row['VelY'],
-                    'Sys_Class': sys_row['Class'], 'Sys_Probability': sys_row['Probability'],
-                    'Ref_PosX': None, 'Ref_PosY': None, 'Ref_PosZ': None,
-                    'Ref_Yaw': None, 'Ref_Pitch': None, 'Ref_Roll': None,
-                    'Ref_Width': None, 'Ref_Length': None, 'Ref_Height': None,
-                    'Ref_VelX': None, 'Ref_VelY': None,
-                    'Ref_Class': None,
-                })
+                records.append({'Sample token': sample_token, 'Paired': False,
+                                'Distance': None, 'IoU': None,
+                                **sys_fields(sys_sample.iloc[s]), **empty_ref})
 
-            # Unpaired reference objects
             for r in unmatched_ref:
-                ref_row = ref_sample.iloc[r]
-                records.append({
-                    'Sample token': sample_token,
-                    'Paired': False,
-                    'Distance': None,
-                    'IoU': None,
-                    'Sys_PosX': None, 'Sys_PosY': None, 'Sys_PosZ': None,
-                    'Sys_Yaw': None, 'Sys_Pitch': None, 'Sys_Roll': None,
-                    'Sys_Width': None, 'Sys_Length': None, 'Sys_Height': None,
-                    'Sys_VelX': None, 'Sys_VelY': None,
-                    'Sys_Class': None, 'Sys_Probability': None,
-                    'Ref_PosX': ref_row['PosX'], 'Ref_PosY': ref_row['PosY'], 'Ref_PosZ': ref_row['PosZ'],
-                    'Ref_Yaw': ref_row['Yaw'], 'Ref_Pitch': ref_row['Pitch'], 'Ref_Roll': ref_row['Roll'],
-                    'Ref_Width': ref_row['Width'], 'Ref_Length': ref_row['Length'], 'Ref_Height': ref_row['Height'],
-                    'Ref_VelX': ref_row['VelX'], 'Ref_VelY': ref_row['VelY'],
-                    'Ref_Class': ref_row['Class'],
-                })
+                records.append({'Sample token': sample_token, 'Paired': False,
+                                'Distance': None, 'IoU': None,
+                                **empty_sys, **ref_fields(ref_sample.iloc[r])})
 
-        return pd.DataFrame(records)
+        df = pd.DataFrame(records)
+
+        lookup = self._build_frame_lookup()
+        df['Frame'] = df['Sample token'].map(lambda t: int(lookup[t].split('_')[1]))
+        return df
 
     # Visualization
     def visualize_scene(self, output_path: str, paired_df: pd.DataFrame, visualizer_type = CameraVisualizer):
@@ -292,9 +294,21 @@ class Scene:
 
 
 if __name__ == '__main__':
-    test_scene_path = r"D:/Programiki do nauki i inne/Szkolne/Studia/Projekt inzynierski/Logi NuScenes/scene-0103"
-    test_scene = Scene(test_scene_path)
-    test_scene.build_scene()
-    test_scene.build_pairs()
-    test_scene.visualize_scene(r'D:\Programiki do nauki i inne\Szkolne\Studia\Projekt inzynierski\Logi NuScenes\scene-0103\scene-0103\output')
+    scene_path = r"D:\Programiki do nauki i inne\Szkolne\Studia\Projekt inzynierski\Logi NuScenes\scene-0103"
+    cfg = Config(path=scene_path, n_jobs=1)
+    scene = Scene(scene_path=scene_path, cfg=cfg)
+    scene.build_scene()
+
+    scene.paired_df          = scene.build_pairs(scene.detr_data)
+    scene.adatrack_paired_df = scene.build_pairs(scene.adatrack_data)
+    scene.paired_df['Scene']          = 'scene-0103'
+    scene.adatrack_paired_df['Scene'] = 'scene-0103'
+
+    df = scene.adatrack_paired_df
+    print(len(df), int(df['Paired'].sum()))
+    print(df[['Sys_Class', 'Ref_Class', 'IoU', 'Sys_TrackID', 'Ref_Instance', 'Frame']].describe(include='all'))
+
+    out = os.path.join(scene_path, 'debug_output')
+    # scene.visualize_scene(os.path.join(out, 'DETR'),     scene.paired_df,          visualizer_type=cfg.visualizer_type)
+    # scene.visualize_scene(os.path.join(out, 'ADATRACK'), scene.adatrack_paired_df, visualizer_type=cfg.visualizer_type)
     db = 0

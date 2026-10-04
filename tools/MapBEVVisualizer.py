@@ -98,6 +98,9 @@ class MapBEVVisualizer:
         ax.add_patch(Polygon(px, closed=True, fill=False,
                              edgecolor=color, lw=1.5, linestyle=ls))
 
+        if prefix == 'Sys' and pd.notna(row.get('Sys_TrackID')):
+            ax.text(px[0][0], px[0][1], f"{int(row['Sys_TrackID'])}", color=color, fontsize=7)
+
     def save_all(self, output_path: str, frame_lookup: dict):
         os.makedirs(output_path, exist_ok=True)
         for sample_token in self.df['Sample token'].unique():

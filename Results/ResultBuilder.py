@@ -6,6 +6,7 @@ from tqdm import tqdm
 from Scene import Scene
 from tools.NuScenesVisualizer import NuscCameraVisualizer
 from tools.CameraVisualizer import CameraVisualizer
+from tools.TrackingEvaluation import TrackingEvaluator
 
 
 class ResultBuilder:
@@ -37,14 +38,16 @@ class ResultBuilder:
     def build(self):
         scene_dirs = [d for d in os.listdir(self.path)
                       if os.path.isdir(os.path.join(self.path, d))
-                      and d.startswith('scene-')]
+                      and d.startswith('scene-')
+                      and os.path.exists(os.path.join(self.path, d, 'results_nusc_detr3d.json'))
+                      and os.path.exists(os.path.join(self.path, d, 'results_nusc.json'))]
 
         output_root = self.cfg.output_dir
 
         for scene_dir in tqdm(scene_dirs, desc='Building scenes'):
             scene_path = os.path.join(self.path, scene_dir)
 
-            scene = Scene(scene_path, self.cfg)
+            scene = Scene(scene_path, self.cfg, self.CLASS_MAP)
             scene.build_scene()
 
             scene.paired_df = scene.build_pairs(scene.detr_data)
@@ -58,7 +61,8 @@ class ResultBuilder:
             ada_out = os.path.join(scene_out, 'ADATRACK')
 
             self.calculate_metrics(scene.paired_df, detr_out)
-            self.calculate_metrics(scene.adatrack_paired_df, ada_out)
+            self.calculate_metrics(scene.adatrack_paired_df, ada_out,
+                                   extra_sheets=self._tracking_sheets(scene.adatrack_paired_df))
 
             if self.cfg.visualize:
                 scene.visualize_scene(detr_out, scene.paired_df, visualizer_type=self.cfg.visualizer_type)
@@ -70,9 +74,11 @@ class ResultBuilder:
         self.adatrack_df = pd.concat([s.adatrack_paired_df for s in self.dataset], ignore_index=True)
 
         self.calculate_metrics(self.df, os.path.join(output_root, 'DETR'))
-        self.calculate_metrics(self.adatrack_df, os.path.join(output_root, 'ADATRACK'))
+        self.calculate_metrics(self.adatrack_df, os.path.join(output_root, 'ADATRACK'),
+                               extra_sheets=self._tracking_sheets(self.adatrack_df))
 
-    def calculate_metrics(self, df: pd.DataFrame, output_dir: str, iou_threshold=0.5):
+    def calculate_metrics(self, df: pd.DataFrame, output_dir: str, iou_threshold=None, extra_sheets=None):
+        iou_threshold = self.cfg.iou_threshold if iou_threshold is None else iou_threshold
         df = df.copy()
         df['Ref_Class_Mapped'] = df['Ref_Class'].map(self.CLASS_MAP)
 
@@ -153,5 +159,10 @@ class ResultBuilder:
         with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
             metrics_df.to_excel(writer, sheet_name='Metrics', index=False)
             cm.to_excel(writer, sheet_name='Confusion Matrix')
+            for name, sheet in (extra_sheets or {}).items():
+                sheet.to_excel(writer, sheet_name=name, index=False)
 
         return metrics_df, cm
+
+    def _tracking_sheets(self, paired_df):
+        return TrackingEvaluator(paired_df, self.CLASS_MAP, self.cfg.iou_threshold).sheets()
