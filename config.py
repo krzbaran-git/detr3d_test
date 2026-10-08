@@ -7,9 +7,10 @@ from tools.NuScenesVisualizer import NuscCameraVisualizer
 
 @dataclass
 class Config:
-    path: str = r"D:\Programiki do nauki i inne\Szkolne\Studia\Projekt inzynierski\Logi NuScenes"
-    # path: str = r"E:\scenes\val_scenes"
+    # path: str = r"D:\Programiki do nauki i inne\Szkolne\Studia\Projekt inzynierski\Logi NuScenes"
+    path: str = r"E:\scenes\val_scenes"
     output_dir: str = ''
+    selected_scenes: tuple | None = None
 
     # (distance filter [m], heading filter)
     class_params: dict = field(default_factory=lambda: {
@@ -27,8 +28,8 @@ class Config:
     default_params: tuple = (1.5, True)
     heading_limit: float = np.pi / 2
 
-    detr_score_threshold: float = 0.45
-    adatrack_score_threshold: float = 0.45
+    detr_score_threshold: float = 0.5
+    adatrack_score_threshold: float = 0.5
 
     iou_samples: int = 10_000
     iou_threshold: float  = 0.35
@@ -38,12 +39,34 @@ class Config:
     visualizer_type: type = CameraVisualizer
 
     class_range: dict = field(default_factory=lambda: {
-        'car': 50, 'truck': 50, 'bus': 50, 'trailer': 50, 'construction_vehicle': 50,
-        'pedestrian': 40, 'motorcycle': 40, 'bicycle': 40,
-        'traffic_cone': 30, 'barrier': 30,
+        'car': 50,
+        'truck': 50,
+        'bus': 50,
+        'trailer': 50,
+        'construction_vehicle': 50,
+        'pedestrian': 40,
+        'motorcycle': 40,
+        'bicycle': 40,
+        'traffic_cone': 30,
+        'barrier': 30,
     })
     default_range: float = 50.0
     min_gt_pts: int = 1
+
+    eval_classes: dict = field(default_factory=lambda: {
+        'car': True,
+        'truck': True,
+        'bus': True,
+        'trailer': True,
+        'motorcycle': True,
+        'bicycle': True,
+        'pedestrian': True,
+        'construction_vehicle': False, # Not returned by ADATrack
+        'barrier': False,              # Not returned by ADATrack
+        'traffic_cone': False,         # Not returned by ADATrack
+    })
+
+    sweep_thresholds: tuple = field(default_factory=lambda: tuple(round(x, 2) for x in np.arange(0.05, 1.0, 0.05)))
 
     def __post_init__(self):
         if not self.output_dir:

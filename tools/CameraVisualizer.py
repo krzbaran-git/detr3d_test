@@ -36,20 +36,25 @@ class CameraVisualizer:
         if pixels is None:
             return
         edges = [
-            (0,1),(1,2),(2,3),(3,0),
-            (4,5),(5,6),(6,7),(7,4),
-            (0,4),(1,5),(2,6),(3,7),
+            (0, 1), (1, 2), (2, 3), (3, 0),
+            (4, 5), (5, 6), (6, 7), (7, 4),
+            (0, 4), (1, 5), (2, 6), (3, 7),
         ]
         for i, j in edges:
-            cv2.line(self.img, tuple(pixels[i]), tuple(pixels[j]), color, thickness)
+            p1, p2 = self._pt(pixels[i]), self._pt(pixels[j])
+            if p1 is None or p2 is None:
+                continue
+            cv2.line(self.img, p1, p2, color, thickness)
 
     def draw_match(self, sys_pixels, ref_pixels, iou=None):
         if sys_pixels is None or ref_pixels is None:
             return
-        sys_center = tuple(sys_pixels.mean(axis=0).astype(int))
-        ref_center = tuple(ref_pixels.mean(axis=0).astype(int))
+        sys_center = self._pt(sys_pixels.mean(axis=0))
+        ref_center = self._pt(ref_pixels.mean(axis=0))
+        if sys_center is None or ref_center is None:
+            return
         cv2.line(self.img, sys_center, ref_center, (255, 255, 255), 1)
-        if iou is not None:
+        if iou is not None and not pd.isna(iou):
             mid = ((sys_center[0] + ref_center[0]) // 2,
                    (sys_center[1] + ref_center[1]) // 2)
             cv2.putText(self.img, f'{iou:.2f}', mid,
@@ -108,6 +113,13 @@ class CameraVisualizer:
 
     def get_image(self) -> np.ndarray:
         return self.img
+
+    @staticmethod
+    def _pt(p):
+        x, y = float(p[0]), float(p[1])
+        if not (np.isfinite(x) and np.isfinite(y)):
+            return None
+        return (int(np.clip(x, -1e5, 1e5)), int(np.clip(y, -1e5, 1e5)))
 
     @staticmethod
     def row_to_obj(row, prefix: str) -> dict:

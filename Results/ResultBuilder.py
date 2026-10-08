@@ -7,7 +7,7 @@ from Scene import Scene
 from tools.NuScenesVisualizer import NuscCameraVisualizer
 from tools.CameraVisualizer import CameraVisualizer
 from tools.TrackingEvaluation import TrackingEvaluator
-
+from tools.ThresholdAnalysis import ThresholdAnalysis
 
 class ResultBuilder:
 
@@ -44,6 +44,10 @@ class ResultBuilder:
 
         output_root = self.cfg.output_dir
 
+        if self.cfg.selected_scenes:
+            allowed = set(self.cfg.selected_scenes)
+            scene_dirs = [d for d in scene_dirs if d in allowed]
+
         for scene_dir in tqdm(scene_dirs, desc='Building scenes'):
             scene_path = os.path.join(self.path, scene_dir)
 
@@ -76,6 +80,10 @@ class ResultBuilder:
         self.calculate_metrics(self.df, os.path.join(output_root, 'DETR'))
         self.calculate_metrics(self.adatrack_df, os.path.join(output_root, 'ADATRACK'),
                                extra_sheets=self._tracking_sheets(self.adatrack_df))
+        # Threshold analysis
+        ta = ThresholdAnalysis(self.cfg, self.CLASS_MAP)
+        sweeps = {'DETR': ta.sweep(self.df), 'ADATRACK': ta.sweep(self.adatrack_df)}
+        ta.export(sweeps, os.path.join(output_root, 'THRESHOLDS'))
 
     def calculate_metrics(self, df: pd.DataFrame, output_dir: str, iou_threshold=None, extra_sheets=None):
         iou_threshold = self.cfg.iou_threshold if iou_threshold is None else iou_threshold

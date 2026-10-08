@@ -49,6 +49,7 @@ class Scene:
         self._parse_labeling_data()
         self._enrich_with_sample_data()
         self._enrich_with_cameras()
+        self._restrict_classes()
 
     def _parse_detr_data(self):
         path = self.scene_path + '/results_nusc_detr3d.json'
@@ -171,6 +172,20 @@ class Scene:
 
     def _find_by_token(self, data: list[dict], token_name: str, token_value: str) -> dict | None:
         return next((item for item in data if item[token_name] == token_value), None)
+
+    def _restrict_classes(self):
+        allowed = {c for c, on in self.cfg.eval_classes.items() if on}
+        if not allowed:
+            return
+
+        for name in ('detr_data', 'adatrack_data'):
+            df = getattr(self, name, None)
+            if df is not None:
+                setattr(self, name, df[df['Class'].isin(allowed)].reset_index(drop=True))
+
+        if self.labeling_data is not None:
+            mapped = self.labeling_data['Class'].map(self.class_map)
+            self.labeling_data = self.labeling_data[mapped.isin(allowed)].reset_index(drop=True)
 
     # Data evaluation
     def build_pairs(self, detections: pd.DataFrame) -> pd.DataFrame:
